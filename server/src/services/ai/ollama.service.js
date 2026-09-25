@@ -1,90 +1,130 @@
-import { env } from '../../config/env.js';
-import { logger } from '../../config/logger.js';
+import { env } from "../../config/env.js";
+import { logger } from "../../config/logger.js";
 
 export class OllamaService {
   /**
-   * Check if local Ollama server is reachable and model is available
+   * Check whether Ollama is running
+   * and retrieve installed models.
    */
   static async checkHealth() {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000);
+      const baseUrl = env.OLLAMA_BASE_URL?.replace(/\/$/, "");
 
-      const res = await fetch(`${env.OLLAMA_BASE_URL}/api/tags`, {
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
+      if (!baseUrl) {
+        throw new Error("OLLAMA_BASE_URL is not configured.");
+      }
 
-      if (!res.ok) return { online: false, modelFound: false };
+      const response = await fetch(`${baseUrl}/api/tags`);
 
-      const data = await res.json();
-      const models = data.models || [];
-      const modelFound = models.some(
-        m => m.name.toLowerCase() === env.OLLAMA_MODEL.toLowerCase() ||
-             m.name.toLowerCase().startsWith(env.OLLAMA_MODEL.toLowerCase().split(':')[0])
-      );
+      if (!response.ok) {
+        const body = await response.text();
+
+        throw new Error(
+          `Ollama health check failed: HTTP ${response.status} - ${body}`,
+        );
+      }
+
+      const data = await response.json();
 
       return {
         online: true,
-        model: env.OLLAMA_MODEL,
-        modelFound,
-        availableModels: models.map(m => m.name)
+        models: data.models || [],
       };
     } catch (error) {
-      logger.warn(`Ollama health check failed: ${error.message}`);
-      return { online: false, modelFound: false, error: error.message };
+      logger.error(`Ollama health check failed: ${error.message}`);
+
+      return {
+        online: false,
+        models: [],
+      };
     }
   }
 
   /**
-   * Send prompt to Ollama LLM (Qwen3:8b)
-   * @param {string} prompt 
-   * @param {object} options 
-   * @returns {Promise<string>}
+   * Generate text using Ollama /api/generate.
    */
-  static async generate({ prompt, system = null, jsonFormat = false, temperature = 0.2 }) {
-    const url = `${env.OLLAMA_BASE_URL}/api/generate`;
+  static async generate({ model, prompt, system = "", temperature = 0.2 }) {
+    if (!model) {
+      throw new Error("Ollama model is required.");
+    }
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), env.OLLAMA_TIMEOUT_MS);
+    if (!prompt) {
+      throw new Error("Ollama prompt is required.");
+    }
+
+    const baseUrl = env.OLLAMA_BASE_URL?.replace(/\/$/, "");
+
+    if (!baseUrl) {
+      throw new Error("OLLAMA_BASE_URL is not configured.");
+    }
+
+    const payload = {
+      model,
+      prompt,
+      stream: false,
+      options: {
+        temperature,
+      },
+    };
+
+    /**
+     * Only add system when it exists.
+     */
+    if (system?.trim()) {
+      payload.system = system.trim();
+    }
+
+    logger.debug(`Sending request to Ollama: ${baseUrl}/api/generate`);
+
+    logger.debug(`Ollama model: ${model}`);
 
     try {
-      const body = {
-        model: env.OLLAMA_MODEL,
-        prompt,
-        stream: false,
-        options: {
-          temperature
-        }
-      };
+      const response = await fetch(`${baseUrl}/api/generate`, {
+        method: "POST",
 
-      if (system) {
-        body.system = system;
-      }
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
 
-      if (jsonFormat) {
-        body.format = 'json';
-      }
-
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal
+        body: JSON.stringify(payload),
       });
 
-      clearTimeout(timeoutId);
+      /**
+       * Always read the response body first.
+       * This makes Ollama errors much easier to diagnose.
+       */
+      const responseText = await response.text();
 
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`Ollama API error (${res.status}): ${errorText}`);
+      if (!response.ok) {
+        throw new Error(`Ollama HTTP ${response.status}: ${responseText}`);
       }
 
-      const data = await res.json();
+      let data;
+
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        throw new Error(`Invalid JSON response from Ollama: ${responseText}`);
+      }
+
+      /**
+       * Ollama /api/generate returns:
+       *
+       * {
+       *   "model": "...",
+       *   "response": "...",
+       *   "done": true
+       * }
+       */
+      if (typeof data.response !== "string") {
+        throw new Error(`Ollama returned an invalid response: ${responseText}`);
+      }
+
       return data.response;
     } catch (error) {
-      clearTimeout(timeoutId);
-      logger.error(`Ollama generate failed (${env.OLLAMA_MODEL}):`, error.message);
+      logger.error(`Ollama generate failed (${model}): ${error.message}`);
+
       throw error;
     }
   }
